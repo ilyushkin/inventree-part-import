@@ -48,9 +48,11 @@ class TME(Supplier):
     def search(self, search_term):
         tme_part = self.tme_api.get_product(search_term)
         if tme_part:
-            tme_stocks = self.tme_api.get_prices_and_stocks([tme_part["Symbol"]])
-            tme_stock = tme_stocks[0] if tme_stocks else {}
-            return [self.get_api_part(tme_part, tme_stock)], 1
+            result_data = self.tme_api.get_prices_and_stocks([tme_part["Symbol"]])
+            tme_stocks = result_data.get("ProductList", [])
+            tme_stock = tme_stocks[0] if isinstance(tme_stocks, list) and len(tme_stocks) > 0 else {}
+            price_type = result_data.get("PriceType", "GROSS")  # default fallback
+            return [self.get_api_part(tme_part, tme_stock, price_type)], 1
 
         if not (results := self.tme_api.product_search(search_term)):
             return [], 0
@@ -69,11 +71,16 @@ class TME(Supplier):
         if len(exact_matches) == 1:
             filtered_matches = exact_matches
 
-        tme_stocks = self.tme_api.get_prices_and_stocks([m["Symbol"] for m in filtered_matches])
-        return list(map(self.get_api_part, filtered_matches, tme_stocks)), len(filtered_matches)
+        result_data = self.tme_api.get_prices_and_stocks([m["Symbol"] for m in filtered_matches])
+        tme_stocks = result_data.get("ProductList", [])
+        price_type = result_data.get("PriceType", "GROSS")  # fallback to GROSS
+        return list(
+            map(lambda args: self.get_api_part(args[0], args[1], price_type), zip(filtered_matches, tme_stocks))
+        ), len(filtered_matches)
 
-    def get_api_part(self, tme_part, tme_stock):
-        to_net_price = 1 if tme_stock["PriceType"] == "NET" else 100 / (100 + tme_stock["VatRate"])
+
+    def get_api_part(self, tme_part, tme_stock, price_type):
+        to_net_price = 1 if price_type == "NET" else 100 / (100 + tme_stock.get("VatRate", 0))
         price_breaks = {
             price_break["Amount"]: price_break["PriceValue"] * to_net_price
             for price_break in tme_stock.get("PriceList", [])
@@ -210,7 +217,7 @@ class TMEApi:
         if result := self._api_call("Products/GetPricesAndStocks", data):
             result_data = result.json()["Data"]
             assert result_data["Currency"] == self.currency
-            return result_data["ProductList"]
+            return result_data
         return []
 
     def get_categories(self):
