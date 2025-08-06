@@ -29,10 +29,11 @@ class ImportResult(Enum):
         return self if self.value < other.value else other
 
 class PartImporter:
-    def __init__(self, inventree_api, interactive=False, verbose=False):
+    def __init__(self, inventree_api, interactive=False, verbose=False, force_datasheet_update=False):
         self.api = inventree_api
         self.interactive = interactive
         self.verbose = verbose
+        self.force_datasheet_update = force_datasheet_update
         self.dry_run = hasattr(inventree_api, "DRY_RUN")
 
         # preload pre_creation_hooks
@@ -58,14 +59,30 @@ class PartImporter:
         import_result = ImportResult.SUCCESS
 
         self.existing_manufacturer_part = None
-        search_results = search(search_term, supplier_id, only_supplier)
+        extracted_mpn = None
+        
+        # Sequential search to enable MPN propagation between suppliers
+        search_results = search(search_term, supplier_id, only_supplier, sequential=True)
         for supplier, async_results in search_results:
             info(f"searching at {supplier.name} ...")
             results, result_count = async_results.get()
 
             if not results:
                 hint(f"no results at {supplier.name}")
-                continue
+                # If we have an extracted MPN and this supplier found nothing, try searching with MPN
+                if extracted_mpn and extracted_mpn != search_term:
+                    info(f"retrying at {supplier.name} with extracted MPN '{extracted_mpn}' ...")
+                    try:
+                        # Get the supplier object to perform MPN search
+                        supplier_obj = async_results.get_supplier_object()
+                        mpn_results, mpn_count = supplier_obj.search(extracted_mpn)
+                        if mpn_results:
+                            results, result_count = mpn_results, mpn_count
+                    except Exception as e:
+                        hint(f"MPN search failed at {supplier.name}: {e}")
+                
+                if not results:
+                    continue
 
             if len(results) == 1:
                 api_part = results[0]
@@ -81,6 +98,11 @@ class PartImporter:
                 warning(f"found {result_count} parts at {supplier.name}, skipping import")
                 import_result |= ImportResult.INCOMPLETE
                 continue
+
+            # Extract MPN from the first successful part for use with other suppliers
+            if not extracted_mpn and api_part.MPN and api_part.MPN != api_part.SKU:
+                extracted_mpn = api_part.MPN
+                info(f"extracted MPN '{extracted_mpn}' for subsequent supplier searches")
 
             try:
                 import_result |= self.import_supplier_part(supplier, api_part, existing_part)
@@ -183,7 +205,22 @@ class PartImporter:
                 upload_image(part, api_part.image_url)
 
             attachment_types = {attachment.comment for attachment in part.getAttachments()}
-            if "datasheet" not in attachment_types and api_part.datasheet_url:
+            should_upload_datasheet = (
+                api_part.datasheet_url and 
+                ("datasheet" not in attachment_types or self.force_datasheet_update)
+            )
+            
+            if should_upload_datasheet:
+                # Remove existing datasheet attachments if force update is enabled
+                if self.force_datasheet_update and "datasheet" in attachment_types:
+                    existing_datasheets = [att for att in part.getAttachments() if att.comment == "datasheet"]
+                    for attachment in existing_datasheets:
+                        try:
+                            attachment.delete()
+                            info(f"removed existing datasheet: {attachment.attachment}")
+                        except Exception as e:
+                            warning(f"failed to remove existing datasheet: {e}")
+                
                 match get_config().get("datasheets"):
                     case "upload":
                         upload_datasheet(part, api_part.datasheet_url)

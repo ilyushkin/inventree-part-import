@@ -1,15 +1,14 @@
 import re
 
 from bs4 import BeautifulSoup
-from requests.compat import quote, urljoin
+from requests.compat import urljoin
+from urllib.parse import quote
 
 from ..error_helper import *
 from ..localization import get_language
-from .base import ApiPart, ScrapeSupplier, SupplierSupportLevel, money2float
+from .base import ApiPart, ScrapeSupplier, SupplierSupportLevel
 
-BASE_URL = "https://reichelt.com/"
-LOCALE_CHANGE_URL = f"{BASE_URL}index.html?ACTION=12&PAGE=46"
-SEARCH_URL = f"{BASE_URL}index.html?ACTION=446&q={{}}"
+BASE_URL = "https://www.reichelt.com/"
 
 class Reichelt(ScrapeSupplier):
     SUPPORT_LEVEL = SupplierSupportLevel.SCRAPING
@@ -27,10 +26,15 @@ class Reichelt(ScrapeSupplier):
 
         self.language = language
         self.location = location
-        self.localized_url = f"{BASE_URL}{self.location.lower()}/{self.language.lower()}/"
-        self.locale_confirm_regex = re.compile(
-            rf";CCOUNTRY={LOCATION_MAP[self.location]};LANGUAGE={self.language};CTYPE=1;"
-        )
+
+        # Add Accept-Language header matching Netherlands/English preference
+        if not hasattr(self, 'extra_headers'):
+            self.extra_headers = {}
+        
+        # Set Accept-Language to prefer English but with Dutch fallback for Netherlands
+        self.extra_headers.update({
+            'Accept-Language': 'en-US,en;q=0.9,nl;q=0.8,de;q=0.1'
+        })
 
         if browser_cookies:
             self.cookies_from_browser(browser_cookies, "reichelt.com")
@@ -40,14 +44,14 @@ class Reichelt(ScrapeSupplier):
         return True
 
     def search(self, search_term):
-        if SKU_REGEX.fullmatch(search_term):
-            sku_link = f"{self.localized_url}-{search_term}.html"
-            if product_page := self.scrape(sku_link):
-                product_page_soup = BeautifulSoup(product_page.content, "html.parser")
-                return [self.get_api_part(product_page_soup, search_term, sku_link)], 1
-
-        search_safe = quote(search_term, safe="")
-        if not (result := self.scrape(SEARCH_URL.format(search_safe))):
+        # Use the actual search URL structure from the website: /nl/en/shop/search
+        search_safe = quote(search_term)
+        
+        # Build search URL matching actual website structure seen in HTML
+        # The website uses /nl/en/shop/search with search parameter
+        search_url = f"{BASE_URL}nl/en/shop/search?search={search_safe}"
+            
+        if not (result := self.scrape(search_url)):
             return [], 0
 
         search_soup = BeautifulSoup(result.content, "html.parser")
@@ -55,17 +59,43 @@ class Reichelt(ScrapeSupplier):
         api_parts = []
         search_results = search_soup.find_all("div", class_="al_gallery_article")
         for result in search_results[:self.max_results]:
-            product_url = result.find("a", itemprop="url")["href"]
-            sku = PRODUCT_URL_SKU_REGEX.match(product_url).group(1).upper()
-
-            sku_link = f"{self.localized_url}-{sku.lower()}.html"
-            if not (product_page := self.scrape(sku_link)):
+            # Extract part number, name, and URL using meta tags like the alternative library
+            part_meta = result.find("meta", itemprop="productID")
+            name_meta = result.find("meta", itemprop="name")
+            url_link = result.find("a", class_="al_artinfo_link")
+            
+            if not part_meta or not name_meta or not url_link:
+                continue
+                
+            sku = part_meta.get("content")
+            
+            # Extract product URL and ensure it uses Netherlands/English structure
+            product_url = url_link.get("href")
+            
+            # Convert product URL to use Netherlands/English locale structure (/nl/en/)
+            full_product_url = urljoin(BASE_URL, product_url)
+            
+            # Ensure URL uses the correct locale structure - convert to /nl/en/ if needed
+            if "/nl/en/" not in full_product_url:
+                # Replace any existing locale part with /nl/en/
+                # Pattern to match existing locale structures like /de/de/ or /en/en/
+                locale_pattern = r'reichelt\.com/[a-z]{2}/[a-z]{2}/'
+                if re.search(locale_pattern, full_product_url):
+                    full_product_url = re.sub(locale_pattern, 'reichelt.com/nl/en/', full_product_url)
+                else:
+                    # If no locale structure, add it after domain
+                    full_product_url = full_product_url.replace('reichelt.com/', 'reichelt.com/nl/en/')
+            
+            if not (product_page := self.scrape(full_product_url)):
                 continue
 
             product_page_soup = BeautifulSoup(product_page.content, "html.parser")
-            api_part = self.get_api_part(product_page_soup, sku, sku_link)
+            api_part = self.get_api_part(product_page_soup, sku, full_product_url)
 
-            if len(search_results) > 1 and search_term.lower() not in api_part.MPN.lower():
+            # Only filter if search term doesn't match either SKU or MPN
+            if (len(search_results) > 1 and 
+                search_term.lower() not in api_part.MPN.lower() and 
+                search_term.lower() not in api_part.SKU.lower()):
                 continue
 
             api_parts.append(api_part)
@@ -82,52 +112,184 @@ class Reichelt(ScrapeSupplier):
         return api_parts, n_results if n_results > self.max_results else len(api_parts)
 
     def get_api_part(self, soup, sku, link):
-        description = soup.find(id="av_articleheader").find("span", itemprop="name").text
+        # Get part name using the correct selector
+        name_elem = soup.find("h1", attrs={"itemprop":"name"})
+        description = name_elem.text.strip() if name_elem else ""
 
-        bigimage = soup.find(id="av_bildbox").find(id="bigimages nohighlight")
-        image_url = bigimage.find("img")["src"] if bigimage else None
+        # Get image URL - try to find product images
+        image_url = None
+        # Try different possible image selectors
+        for img_selector in [
+            "img[itemprop='image']",
+            ".productImage img",
+            "#av_bildbox img",
+            ".al_gallery_article img"
+        ]:
+            img_elem = soup.select_one(img_selector)
+            if img_elem and img_elem.get("src"):
+                src = img_elem["src"]
+                if src.startswith("http"):
+                    image_url = src
+                else:
+                    image_url = urljoin(BASE_URL, src)
+                break
 
+        # Get datasheet URL - prioritize actual datasheets over other documents
         datasheet_url = None
-        if datasheet_view := soup.find(id="av_datasheetview"):
-            if datasheet := datasheet_view.find(class_="av_datasheet"):
-                datasheet_url = urljoin(BASE_URL, datasheet.find("a")["href"])
+        datasheet_divs = soup.find_all("div", attrs={"class": "articleDatasheet"})
+        
+        # First, look for a datasheet specifically labeled as "Datenblatt" or "Datasheet"
+        for div in datasheet_divs:
+            datasheet_link = div.find("a")
+            if datasheet_link:
+                link_text = datasheet_link.get_text(strip=True).lower()
+                if "datenblatt" in link_text or "datasheet" in link_text:
+                    datasheet_url = urljoin(BASE_URL, datasheet_link.get("href"))
+                    break
+        
+        # If no specific datasheet found, look for PDFs that contain the part number or model
+        if not datasheet_url:
+            for div in datasheet_divs:
+                datasheet_link = div.find("a")
+                if datasheet_link:
+                    href = datasheet_link.get("href", "")
+                    link_text = datasheet_link.get_text(strip=True)
+                    # Prefer PDFs that contain the part number/model and are not "replacing" or version-specific docs
+                    if (href.endswith(".pdf") and 
+                        not "replacing" in link_text.lower() and 
+                        not "10xx" in link_text.lower() and
+                        len(link_text) > 5):  # Avoid very short generic names
+                        datasheet_url = urljoin(BASE_URL, href)
+                        break
+        
+        # Fallback to first available PDF if nothing better found
+        if not datasheet_url and datasheet_divs:
+            datasheet_link = datasheet_divs[0].find("a")
+            if datasheet_link and datasheet_link.get("href", "").endswith(".pdf"):
+                datasheet_url = urljoin(BASE_URL, datasheet_link.get("href"))
 
-        availability = soup.find("p", class_="availability").find("span")["class"][0]
-        if availability not in AVAILABILITY_MAP:
-            warning(f"unknown reichelt availability '{availability}' ({link})")
+        # Get availability using the link selector from alternative library
+        availability_link = soup.find("link", attrs={"itemprop":"availability"})
+        availability = "status_1"  # Default to available
+        if availability_link:
+            availability_href = availability_link.get("href", "")
+            availability_status = availability_href.split("/")[-1] if availability_href else ""
+            # Map to the existing availability system
+            if "InStock" in availability_status:
+                availability = "InStock"
+            elif "OutOfStock" in availability_status:
+                availability = "OutOfStock"
+            elif "PreOrder" in availability_status:
+                availability = "PreOrder"
+            elif "BackOrder" in availability_status:
+                availability = "BackOrder"
 
-        breadcrumb = soup.find("ol", id="breadcrumb")
-        category_path = [
-            li.find("a").text
-            for li in breadcrumb.find_all("li", itemprop="itemListElement")[1:]
-        ]
+        # Get categories from breadcrumb
+        category_path = []
+        breadcrumb = soup.find_all("ol", class_="breadcrumb")
+        if breadcrumb:
+            for category in breadcrumb[0].find_all("span", itemprop="name"):
+                if category.contents:
+                    category_path.append(category.contents[0].strip())
 
-        parameters = {
-            prop_name.text.strip(): prop_value.text.strip()
-            for ul in soup.find("div", id="av_props_inline").find_all("ul", class_="clearfix")
-            if (prop_name := ul.find("li", "av_propname"))
-            and (prop_value := ul.find("li", "av_propvalue"))
-        }
+        # Get technical parameters 
+        parameters = {}
+        data_sections = soup.find_all("ul", attrs={"class":"articleTechnicalData"})
+        for data_section in data_sections:
+            headline_elem = data_section.find("li", class_="articleTechnicalHeadline")
+            if not headline_elem:
+                continue
+                
+            headline = headline_elem.text.strip()
+            for attr_section in data_section.find_all("ul", class_="articleAttribute"):
+                data_lis = attr_section.find_all("li")
+                for i in range(0, len(data_lis), 2):
+                    if i + 1 < len(data_lis):
+                        name = data_lis[i].text.strip()
+                        value = data_lis[i+1].text.strip()
+                        # Use flat structure for parameters
+                        parameters[name] = value
 
-        if not (manufacturer := parameters.get("Manufacturer")):
-            manufacturer = "Reichelt"
+        # Get manufacturer - try multiple approaches
+        manufacturer = "Reichelt"  # default fallback
+        
+        # Method 1: Look for itemprop="brand" in manufacturer specifications
+        brand_elem = soup.find("li", attrs={"itemprop": "brand"})
+        if brand_elem:
+            manufacturer = brand_elem.text.strip()
+        else:
+            # Method 2: Get from parameters if available
+            manufacturer = parameters.get("Manufacturer", "Reichelt")
+        
+        # Get MPN - try multiple approaches to find the manufacturer part number
+        mpn = sku  # fallback to SKU
+        
+        # Method 1: Look for itemprop="mpn" in manufacturer specifications
+        mpn_elem = soup.find("li", attrs={"itemprop": "mpn"})
+        if mpn_elem:
+            mpn = mpn_elem.text.strip()
+        else:
+            # Method 2: Look for "Man. part no.:" in the product info section
+            man_part_elements = soup.find_all("small")
+            for element in man_part_elements:
+                text = element.get_text()
+                if "Man. part no.:" in text:
+                    # Extract the part number from the span with b tag
+                    b_elem = element.find("b")
+                    if b_elem:
+                        mpn = b_elem.text.strip()
+                        break
+            
+            # Method 3: Fallback to parameters if available
+            if mpn == sku:
+                mpn = parameters.get("Manufacturer ID", parameters.get("Factory number", sku))
 
-        if not (mpn := parameters.get("Factory number")):
-            mpn = soup.find("meta", itemprop="productID")["content"].replace(" ", "")
-            if mpn.startswith("mpn:"):
-                mpn = mpn[4:]
-
+        # Get pricing information
         price_breaks = {}
-        if price := soup.find("meta", itemprop="price"):
-            price_breaks[1] = float(price["content"].replace(",", ""))
-        if discounts := soup.find(id="av_price_discount"):
-            for discount in discounts.find("table").find_all("td")[1:]:
-                quantity, price = discount.find_all(text=True)
-                price_breaks[float(quantity)] = money2float(price.text)
-
         currency = None
-        if meta := soup.find("meta", itemprop="priceCurrency"):
-            currency = meta["content"]
+        
+        # Get base price and currency
+        price_meta = soup.find("meta", itemprop="price")
+        currency_meta = soup.find("meta", itemprop="priceCurrency")
+        
+        if price_meta:
+            try:
+                price_breaks[1] = float(price_meta.get("content"))
+            except (ValueError, TypeError):
+                pass
+                
+        if currency_meta:
+            currency = currency_meta.get("content")
+
+        # Try to get discount pricing using the alternative library's approach
+        discount_ul = soup.find("ul", class_="discounts")
+        if discount_ul:
+            for discount_li in discount_ul.find_all("li"):
+                span_quant = discount_li.find("span", attrs={"data-discquant": True})
+                span_price = discount_li.find("span", attrs={"data-discprice": True})
+                
+                if span_quant and span_price:
+                    try:
+                        quantity = int(span_quant.get("data-discquant"))
+                        price = float(span_price.get("data-discprice"))
+                        price_breaks[quantity] = price
+                    except (ValueError, TypeError):
+                        continue
+
+        # Fallback: try productPrice elements if discount parsing failed
+        if len(price_breaks) <= 1:
+            price_elements = soup.find_all('p', class_='productPrice right')
+            if price_elements:
+                for i, elem in enumerate(price_elements):
+                    price_text = elem.get_text(strip=True)
+                    # Remove currency symbols and convert to float
+                    price_cleaned = re.sub(r'[€$£,]', '', price_text)
+                    try:
+                        price_val = float(price_cleaned)
+                        quantity = 10 ** i if i > 0 else 1
+                        price_breaks[quantity] = price_val
+                    except ValueError:
+                        continue
 
         return ApiPart(
             description=description,
@@ -147,28 +309,28 @@ class Reichelt(ScrapeSupplier):
         )
 
     def setup_hook(self):
-        form_page = self.session.get(LOCALE_CHANGE_URL, timeout=self.request_timeout)
-        if form_page.status_code == 200:
-            soup = BeautifulSoup(form_page.content, "html.parser")
-            form_url = soup.find("form", attrs={"name": "contentform"}).attrs["action"]
-
-            result = self.session.post(form_url, timeout=self.request_timeout, data={
-                "CCOUNTRY": LOCATION_MAP[self.location],
-                "LANGUAGE": self.language,
-                "CTYPE": 1,
-            })
-            if result.status_code == 200:
-                soup = BeautifulSoup(result.content, "html.parser")
-                statistics = soup.find("img", width="0", height="0")
-                if self.locale_confirm_regex.search(statistics.get("src", "")):
-                    return
-
-        warning("failed to set Reichelt locales")
-
-IMAGE_URL_FULLSIZE_REGEX = re.compile(r"/resize/[^/]+/[^/]+/")
-IMAGE_URL_FULLSIZE_SUB = "/images/"
-SKU_REGEX = re.compile(r"^[pP]\d+$")
-PRODUCT_URL_SKU_REGEX = re.compile(r"^.*([pP]\d+)\.html[^\.]*$")
+        # Based on actual Reichelt website behavior - use Netherlands/English combination for EUR pricing
+        # The site uses URL structure: reichelt.com/nl/en/ for Netherlands country with English language
+        if hasattr(self, 'session'):
+            # Set cookies to match the actual website behavior observed in HTML
+            self.session.cookies.set('LANGUAGE', 'EN', domain='.reichelt.com')  # Uppercase as shown in usersettings
+            self.session.cookies.set('LA', '3', domain='.reichelt.com')  # 3 = English language code
+            
+            # Use Netherlands country code (662) for EUR pricing - this matches LOCATION_MAP['NL']
+            netherlands_country_code = LOCATION_MAP['NL']  # 662
+            self.session.cookies.set('CCOUNTRY', str(netherlands_country_code), domain='.reichelt.com')
+            
+            # Additional cookies that might be needed based on website behavior
+            self.session.cookies.set('country', 'NL', domain='.reichelt.com')
+            
+            # Make initial request to Netherlands/English homepage to establish proper session
+            try:
+                # Use the actual URL structure seen in the HTML: /nl/en/
+                establish_url = f"{BASE_URL}nl/en/"
+                self.session.get(establish_url, timeout=self.request_timeout)
+            except Exception:
+                # If this fails, continue anyway
+                pass
 
 # None -> available, 0 -> not available
 AVAILABILITY_MAP = {
@@ -180,6 +342,11 @@ AVAILABILITY_MAP = {
     "status_6": 0,
     "status_7": None,
     "status_8": 0,
+    # Add support for schema.org availability detection
+    "InStock": None,
+    "OutOfStock": 0,
+    "PreOrder": None,
+    "BackOrder": None,
 }
 
 LOCATION_MAP = {

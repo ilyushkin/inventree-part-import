@@ -57,12 +57,30 @@ class TME(Supplier):
         if not (results := self.tme_api.product_search(search_term)):
             return [], 0
 
-        filtered_matches = [
-            tme_part for tme_part in results["ProductList"]
-            if tme_part["OriginalSymbol"].lower().startswith(search_term.lower())
-            or tme_part["Symbol"].lower().startswith(search_term.lower())
-        ]
+        # First try to find parts that start with the search term (more flexible matching)
+        filtered_matches = []
+        search_term_clean = search_term.replace(" ", "").replace("-", "").lower()
+        
+        for tme_part in results["ProductList"]:
+            original_clean = tme_part["OriginalSymbol"].replace(" ", "").replace("-", "").lower()
+            symbol_clean = tme_part["Symbol"].replace(" ", "").replace("-", "").lower()
+            
+            # Check if either symbol starts with the cleaned search term
+            if (original_clean.startswith(search_term_clean) or 
+                symbol_clean.startswith(search_term_clean) or
+                tme_part["OriginalSymbol"].lower().startswith(search_term.lower()) or
+                tme_part["Symbol"].lower().startswith(search_term.lower())):
+                filtered_matches.append(tme_part)
 
+        # If no flexible matches, fall back to original logic
+        if not filtered_matches:
+            filtered_matches = [
+                tme_part for tme_part in results["ProductList"]
+                if tme_part["OriginalSymbol"].lower().startswith(search_term.lower())
+                or tme_part["Symbol"].lower().startswith(search_term.lower())
+            ]
+
+        # Look for exact matches
         exact_matches = [
             tme_part for tme_part in filtered_matches
             if tme_part["OriginalSymbol"].lower() == search_term.lower()
@@ -71,16 +89,21 @@ class TME(Supplier):
         if len(exact_matches) == 1:
             filtered_matches = exact_matches
 
-        result_data = self.tme_api.get_prices_and_stocks([m["Symbol"] for m in filtered_matches])
-        tme_stocks = result_data.get("ProductList", [])
-        price_type = result_data.get("PriceType", "GROSS")  # fallback to GROSS
-        return list(
-            map(lambda args: self.get_api_part(args[0], args[1], price_type), zip(filtered_matches, tme_stocks))
-        ), len(filtered_matches)
+        tme_stocks = self.tme_api.get_prices_and_stocks([m["Symbol"] for m in filtered_matches])
+        # Ensure we have matching stock data for each product
+        stock_dict = {stock.get("Symbol", ""): stock for stock in tme_stocks}
+        api_parts = []
+        for match in filtered_matches:
+            stock = stock_dict.get(match["Symbol"], {})
+            api_parts.append(self.get_api_part(match, stock))
+        return api_parts, len(filtered_matches)
 
-
-    def get_api_part(self, tme_part, tme_stock, price_type):
-        to_net_price = 1 if price_type == "NET" else 100 / (100 + tme_stock.get("VatRate", 0))
+    def get_api_part(self, tme_part, tme_stock):
+        # Ensure tme_stock is a dictionary
+        if not isinstance(tme_stock, dict):
+            tme_stock = {}
+            
+        to_net_price = 1 if tme_stock.get("PriceType") == "NET" else (100 / (100 + tme_stock.get("VatRate", 0)) if tme_stock.get("VatRate") else 1)
         price_breaks = {
             price_break["Amount"]: price_break["PriceValue"] * to_net_price
             for price_break in tme_stock.get("PriceList", [])
@@ -264,7 +287,9 @@ class TMEApi:
         url = f"{self.BASE_URL}{action}.json"
         data_sorted = dict(sorted({**data, "Token": self.token}.items()))
 
-        signature_base = f"POST&{quote(url, '')}&{quote(urlencode(data_sorted), '')}".encode()
+        # Encode parameters properly for TME API signature
+        encoded_params = urlencode(data_sorted, quote_via=quote)
+        signature_base = f"POST&{quote(url, safe='')}&{quote(encoded_params, safe='')}".encode()
         signature = b64encode(hmac.new(self.secret.encode(), signature_base, sha1).digest())
         data_sorted["ApiSignature"] = signature
 

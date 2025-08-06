@@ -9,7 +9,7 @@ from ..inventree_helpers import Company
 from .base import ScrapeSupplier, Supplier
 
 _SUPPLIERS = None
-def search(search_term, supplier_id: str = None, only_supplier=False):
+def search(search_term, supplier_id: str = None, only_supplier=False, sequential=False):
     global _SUPPLIERS
     if _SUPPLIERS is None:
         assert _SUPPLIER_COMPANIES is not None, "call setup_supplier_companies(...) first"
@@ -32,11 +32,42 @@ def search(search_term, supplier_id: str = None, only_supplier=False):
             error(f"supplier id '{supplier_id}' not defined in {SUPPLIERS_CONFIG}")
             return None
 
-    thread_pool = ThreadPool(processes=8)
-    return (
-        (api_company, thread_pool.apply_async(supplier_object.cached_search, (search_term,)))
-        for supplier_object, api_company in suppliers
-    )
+    if sequential:
+        # Sequential search: execute each supplier search one at a time
+        # This allows MPN extraction from first successful result to be used for subsequent searches
+        for supplier_object, api_company in suppliers:
+            # Use a simple generator that yields results immediately for sequential processing
+            yield (api_company, _SequentialResult(supplier_object.cached_search, search_term, supplier_object))
+    else:
+        # Parallel search: original behavior
+        thread_pool = ThreadPool(processes=8)
+        return (
+            (api_company, thread_pool.apply_async(supplier_object.cached_search, (search_term,)))
+            for supplier_object, api_company in suppliers
+        )
+
+
+class _SequentialResult:
+    """Helper class to make sequential results compatible with async result interface"""
+    def __init__(self, search_func, search_term, supplier_object):
+        self.search_func = search_func
+        self.search_term = search_term
+        self.supplier_object = supplier_object
+        self._result = None
+        self._executed = False
+    
+    def get(self):
+        if not self._executed:
+            self._result = self.search_func(self.search_term)
+            self._executed = True
+        return self._result
+    
+    def get_supplier_object(self):
+        return self.supplier_object
+    
+    def wait(self):
+        # No-op for sequential results
+        pass
 
 _SUPPLIER_COMPANIES = None
 def setup_supplier_companies(inventree_api):
