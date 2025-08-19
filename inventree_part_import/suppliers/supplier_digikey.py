@@ -56,6 +56,10 @@ class DigiKey(Supplier):
                     x_digikey_locale_language=self.language,
                 )
 
+        # Handle case when supplier has 0 items in stock (results can be None)
+        if not results:
+            return [], 0
+
         if results.exact_manufacturer_products_count > 0:
             filtered_results = results.exact_manufacturer_products
             product_count = results.exact_manufacturer_products_count

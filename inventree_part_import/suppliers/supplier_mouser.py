@@ -40,7 +40,7 @@ class Mouser(ScrapeSupplier):
                 search_request.part_search(search_term)
 
         response = search_request.get_response()
-        if not isinstance(response, dict):
+        if response is None or not isinstance(response, dict):
             return [], 0
         if not ((results := response.get("SearchResults")) and (parts := results.get("Parts"))):
             return [], 0

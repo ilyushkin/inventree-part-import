@@ -210,13 +210,23 @@ class Reichelt(ScrapeSupplier):
                         # Use flat structure for parameters
                         parameters[name] = value
 
-        # Get MPN first - try multiple approaches to find the manufacturer part number
-        mpn = ""
-        manufacturer = ""
+        # Get manufacturer - try multiple approaches
+        manufacturer = "FREI"  # default fallback
+        
+        # Method 1: Look for itemprop="brand" in manufacturer specifications
+        brand_elem = soup.find("li", attrs={"itemprop": "brand"})
+        if brand_elem:
+            manufacturer = brand_elem.text.strip()
+        else:
+            # Method 2: Get from parameters if available
+            manufacturer = parameters.get("Manufacturer", "FREI")
+        
+        # Get MPN - try multiple approaches to find the manufacturer part number
+        mpn = ""  # Start with empty, fallback to SKU if no MPN found
         
         # Method 1: Look for itemprop="mpn" in manufacturer specifications
         mpn_elem = soup.find("li", attrs={"itemprop": "mpn"})
-        if mpn_elem:
+        if mpn_elem and mpn_elem.text.strip():
             mpn = mpn_elem.text.strip()
         
         if not mpn:
@@ -227,31 +237,19 @@ class Reichelt(ScrapeSupplier):
                 if "Man. part no.:" in text:
                     # Extract the part number from the span with b tag
                     b_elem = element.find("b")
-                    if b_elem:
+                    if b_elem and b_elem.text.strip():
                         mpn = b_elem.text.strip()
                         break
         
         if not mpn:
             # Method 3: Fallback to parameters if available
-            mpn = parameters.get("Manufacturer ID", parameters.get("Factory number", ""))
+            param_mpn = parameters.get("Manufacturer ID", parameters.get("Factory number", ""))
+            if param_mpn and param_mpn.strip():
+                mpn = param_mpn
         
-        # Get manufacturer - try multiple approaches
-        # Method 1: Look for itemprop="brand" in manufacturer specifications
-        brand_elem = soup.find("li", attrs={"itemprop": "brand"})
-        if brand_elem:
-            manufacturer = brand_elem.text.strip()
-        else:
-            # Method 2: Get from parameters if available
-            manufacturer = parameters.get("Manufacturer", "")
-        
-        # If no proper MPN found or MPN is empty, use SKU as MPN and set manufacturer to "Reichelt"
-        if not mpn or mpn.strip() == "":
+        # If still no MPN found, use SKU
+        if not mpn:
             mpn = sku
-            manufacturer = "Reichelt"
-        
-        # If manufacturer is still empty but we have an MPN, set a default manufacturer
-        if not manufacturer or manufacturer.strip() == "":
-            manufacturer = "Reichelt"
 
         # Get pricing information
         price_breaks = {}
