@@ -106,6 +106,7 @@ DEFAULT_CONFIG_VARS = {
     "interactive_part_matches": 10,
     "request_timeout": 15.0,
     "retry_timeout": 3.0,
+    "max_retries": 3,
 }
 VALID_CONFIG_VARS = {
     "currency",
